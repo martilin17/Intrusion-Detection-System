@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import pandas as pd
 
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
@@ -32,6 +32,11 @@ LR_T      = 1e-3    # 論文 Table 2：避免大幅改動 CNN-B layer-3 weights
 BATCH_T   = 1024    # 論文 Table 2
 EPOCHS_T  = 2000    # 論文：最多 2000 epochs，early stopping 提前結束
 PATIENCE  = 100     # ✅ Fix-4: 50→100，給 Stage-2 更多時間跳出 false minimum
+S2_WEIGHT_MODE = "none"  # "none" | "sqrt" | "linear"
+S2_WEIGHT_CAP = 3.0      # only used when S2_WEIGHT_MODE != "none"
+S2_LABEL_SMOOTH = 0.0
+S2_TARGET_FPR = 0.03     # threshold tuning target on Stage-2 val
+S2_TARGET_DR = 0.90
 
 # ── 共用 ─────────────────────────────────────────────────────────────────────
 DROPOUT   = 0.5
@@ -237,6 +242,23 @@ cw_stage2 = compute_class_weights(
     y_tr_t, len(CLASS_NAMES), "Stage-2 KDDTest+",
     mode="sqrt", max_ratio=8.0   # ✅ Fix: 15→8, 減少 attack bias，降低 FPR
 )
+
+# Stage-2 class-weight override:
+# - none   : uniform weights to reduce attack over-prediction (lower FPR)
+# - sqrt/* : recompute with configured mode/cap
+if S2_WEIGHT_MODE == "none":
+    cw_stage2 = torch.ones(len(CLASS_NAMES), dtype=torch.float32)
+    print("\n[Class Weights (none) - Stage-2 KDDTest+]")
+    for i, name in enumerate(CLASS_NAMES):
+        c = int((y_tr_t == i).sum())
+        print(f"  {name:8s}: count={c:6d}, weight={1.0000:.4f}")
+elif S2_WEIGHT_MODE in ("sqrt", "linear"):
+    cw_stage2 = compute_class_weights(
+        y_tr_t, len(CLASS_NAMES), "Stage-2 KDDTest+",
+        mode=S2_WEIGHT_MODE, max_ratio=S2_WEIGHT_CAP
+    )
+else:
+    raise ValueError(f"Unknown S2_WEIGHT_MODE: {S2_WEIGHT_MODE}")
 
 # =========================
 # 9) Dataset / DataLoader
@@ -524,7 +546,10 @@ print(f"  BS={BATCH_T}  MaxEpochs={EPOCHS_T}  Patience={PATIENCE}")
 print(f"{'='*65}")
 
 # label_smoothing 降至 0.05（cap 已降低，過度 smoothing 反而損失少數類 DR）
-criterion_t = nn.CrossEntropyLoss(weight=cw_stage2.to(device), label_smoothing=0.05)
+criterion_t = nn.CrossEntropyLoss(
+    weight=cw_stage2.to(device),
+    label_smoothing=S2_LABEL_SMOOTH
+)
 optimizer_t = torch.optim.Adam(param_groups)
 # ✅ Cosine LR scheduler（param groups 各自按比例 decay）
 scheduler_t = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -627,13 +652,55 @@ def metrics_per_class(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) ->
     return results
 
 @torch.no_grad()
-def predict_labels(mdl: nn.Module, loader: DataLoader):
+def predict_labels(mdl: nn.Module, loader: DataLoader, normal_threshold: float = None):
     mdl.eval()
     preds, trues = [], []
     for xb, yb in loader:
-        yhat = torch.argmax(mdl(xb.to(device)), dim=1).cpu().numpy()
+        probs = torch.softmax(mdl(xb.to(device)), dim=1)
+        yhat = torch.argmax(probs, dim=1)
+        if normal_threshold is not None:
+            attack_prob = 1.0 - probs[:, NORMAL_ID]
+            yhat = torch.where(
+                attack_prob >= normal_threshold,
+                yhat,
+                torch.full_like(yhat, NORMAL_ID)
+            )
+        yhat = yhat.cpu().numpy()
         preds.append(yhat); trues.append(yb.numpy())
     return np.concatenate(trues), np.concatenate(preds)
+
+@torch.no_grad()
+def tune_normal_threshold(mdl: nn.Module,
+                          loader: DataLoader,
+                          target_fpr: float = 0.03,
+                          target_dr: float = 0.90):
+    mdl.eval()
+    all_true, all_argmax, all_attack_prob = [], [], []
+
+    for xb, yb in loader:
+        probs = torch.softmax(mdl(xb.to(device)), dim=1).cpu().numpy()
+        all_true.append(yb.numpy())
+        all_argmax.append(np.argmax(probs, axis=1))
+        all_attack_prob.append(1.0 - probs[:, NORMAL_ID])
+
+    y_true = np.concatenate(all_true).astype(np.int64)
+    y_argmax = np.concatenate(all_argmax).astype(np.int64)
+    attack_prob = np.concatenate(all_attack_prob).astype(np.float32)
+
+    best_t, best_m, best_score = 0.5, None, float("inf")
+    for t in np.linspace(0.50, 0.995, 100):
+        y_pred = y_argmax.copy()
+        y_pred[attack_prob < t] = NORMAL_ID
+        m = metrics_overall(y_true, y_pred, normal_id=NORMAL_ID)
+        score = (2.0 * abs(m["FPR"] - target_fpr)) + abs(m["DR"] - target_dr)
+        if score < best_score:
+            best_t, best_m, best_score = float(t), m, score
+
+    print("\n[Stage-2 Threshold Tuning on Val]")
+    print(f"  chosen_threshold={best_t:.4f}")
+    print(f"  val_DR={best_m['DR']*100:.2f}% | val_FPR={best_m['FPR']*100:.2f}% | val_ACC={best_m['ACC']*100:.2f}%")
+    print(f"  target_DR={target_dr*100:.2f}% | target_FPR={target_fpr*100:.2f}%")
+    return best_t
 
 # =========================
 # 15) Paper Reference Numbers
@@ -766,8 +833,9 @@ def print_per_class_table(dataset_name: str,
 
 
 def full_eval(ds_name: str, loader: DataLoader, mdl: nn.Module,
-              paper_ref: dict = None, model_tag: str = "Ours"):
-    y_true, y_pred = predict_labels(mdl, loader)
+              paper_ref: dict = None, model_tag: str = "Ours",
+              normal_threshold: float = None):
+    y_true, y_pred = predict_labels(mdl, loader, normal_threshold=normal_threshold)
     overall   = metrics_overall(y_true, y_pred, normal_id=NORMAL_ID)
     per_class = metrics_per_class(y_true, y_pred, n_classes=len(CLASS_NAMES))
     print_per_class_table(ds_name, per_class, overall,
@@ -795,9 +863,17 @@ print("\n\n" + "=" * 100)
 print("  STAGE-2 RESULTS  ▌ CNN-TL (with Transfer Learning) vs Paper CNN-TL")
 print("=" * 100)
 
+s2_normal_threshold = tune_normal_threshold(
+    cnntl, s2_val_loader, target_fpr=S2_TARGET_FPR, target_dr=S2_TARGET_DR
+)
+print(f"[Stage-2] Apply normal-threshold during eval: {s2_normal_threshold:.4f}")
+
 full_eval("KDDTrain+",  eval_train_loader,  cnntl,
-          paper_ref=PAPER_TL["KDDTrain+"],  model_tag="CNN-TL Stage-2")
+          paper_ref=PAPER_TL["KDDTrain+"],  model_tag="CNN-TL Stage-2",
+          normal_threshold=s2_normal_threshold)
 full_eval("KDDTest+",   eval_test_loader,   cnntl,
-          paper_ref=PAPER_TL["KDDTest+"],   model_tag="CNN-TL Stage-2")
+          paper_ref=PAPER_TL["KDDTest+"],   model_tag="CNN-TL Stage-2",
+          normal_threshold=s2_normal_threshold)
 full_eval("KDDTest-21", eval_test21_loader, cnntl,
-          paper_ref=PAPER_TL["KDDTest-21"], model_tag="CNN-TL Stage-2")
+          paper_ref=PAPER_TL["KDDTest-21"], model_tag="CNN-TL Stage-2",
+          normal_threshold=s2_normal_threshold)
