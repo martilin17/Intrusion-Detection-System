@@ -1,5 +1,6 @@
 ﻿import numpy as np
 import pandas as pd
+import json
 
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 from sklearn.model_selection import train_test_split
@@ -40,6 +41,8 @@ S2_TARGET_DR = 0.865
 S2_TUNE_TOPK = 8
 S2_TUNE_RELAX_FPR = 0.012
 S2_TUNE_RELAX_DR = 0.012
+RUN_TAG = "part1_v4_2"
+SAVE_RUN_REPORT = True
 
 # ── 共用 ─────────────────────────────────────────────────────────────────────
 DROPOUT   = 0.5
@@ -867,6 +870,11 @@ def full_eval(ds_name: str, loader: DataLoader, mdl: nn.Module,
                           paper_ref=paper_ref, model_tag=model_tag)
     return overall, per_class
 
+def save_run_report(path: Path, payload: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"\n[Report] Saved: {path}")
+
 # =========================
 # 17) Evaluation
 # =========================
@@ -876,12 +884,12 @@ print("\n\n" + "=" * 100)
 print("  STAGE-1 RESULTS  ▌ CNN-B (no Transfer Learning) vs Paper CNN (no TL)")
 print("=" * 100)
 
-full_eval("KDDTrain+",  eval_train_loader,  cnnb,
-          paper_ref=PAPER_CNN["KDDTrain+"],  model_tag="CNN-B  Stage-1")
-full_eval("KDDTest+",   eval_test_loader,   cnnb,
-          paper_ref=PAPER_CNN["KDDTest+"],   model_tag="CNN-B  Stage-1")
-full_eval("KDDTest-21", eval_test21_loader, cnnb,
-          paper_ref=PAPER_CNN["KDDTest-21"], model_tag="CNN-B  Stage-1")
+s1_train_overall, _ = full_eval("KDDTrain+",  eval_train_loader,  cnnb,
+                                paper_ref=PAPER_CNN["KDDTrain+"],  model_tag="CNN-B  Stage-1")
+s1_test_overall, _ = full_eval("KDDTest+",   eval_test_loader,   cnnb,
+                               paper_ref=PAPER_CNN["KDDTest+"],   model_tag="CNN-B  Stage-1")
+s1_test21_overall, _ = full_eval("KDDTest-21", eval_test21_loader, cnnb,
+                                 paper_ref=PAPER_CNN["KDDTest-21"], model_tag="CNN-B  Stage-1")
 
 # ── Stage-2: CNN-TL vs Paper CNN-TL ──────────────────────────────────────────
 print("\n\n" + "=" * 100)
@@ -898,12 +906,48 @@ s2_normal_threshold = tune_normal_threshold(
 )
 print(f"[Stage-2] Apply normal-threshold during eval: {s2_normal_threshold:.4f}")
 
-full_eval("KDDTrain+",  eval_train_loader,  cnntl,
-          paper_ref=PAPER_TL["KDDTrain+"],  model_tag="CNN-TL Stage-2",
-          normal_threshold=s2_normal_threshold)
-full_eval("KDDTest+",   eval_test_loader,   cnntl,
-          paper_ref=PAPER_TL["KDDTest+"],   model_tag="CNN-TL Stage-2",
-          normal_threshold=s2_normal_threshold)
-full_eval("KDDTest-21", eval_test21_loader, cnntl,
-          paper_ref=PAPER_TL["KDDTest-21"], model_tag="CNN-TL Stage-2",
-          normal_threshold=s2_normal_threshold)
+s2_train_overall, _ = full_eval("KDDTrain+",  eval_train_loader,  cnntl,
+                                paper_ref=PAPER_TL["KDDTrain+"],  model_tag="CNN-TL Stage-2",
+                                normal_threshold=s2_normal_threshold)
+s2_test_overall, _ = full_eval("KDDTest+",   eval_test_loader,   cnntl,
+                               paper_ref=PAPER_TL["KDDTest+"],   model_tag="CNN-TL Stage-2",
+                               normal_threshold=s2_normal_threshold)
+s2_test21_overall, _ = full_eval("KDDTest-21", eval_test21_loader, cnntl,
+                                 paper_ref=PAPER_TL["KDDTest-21"], model_tag="CNN-TL Stage-2",
+                                 normal_threshold=s2_normal_threshold)
+
+if SAVE_RUN_REPORT:
+    report = {
+        "run_tag": RUN_TAG,
+        "seed": SEED,
+        "seq_len": SEQ_LEN,
+        "stride": STRIDE,
+        "stage1": {
+            "lr": LR_B,
+            "batch_size": BATCH_B,
+            "epochs": EPOCHS_B,
+            "overall": {
+                "KDDTrain+": s1_train_overall,
+                "KDDTest+": s1_test_overall,
+                "KDDTest-21": s1_test21_overall,
+            },
+        },
+        "stage2": {
+            "lr_new": LR_T,
+            "lr_block3": LR_BLOCK3,
+            "batch_size": BATCH_T,
+            "max_epochs": EPOCHS_T,
+            "patience": PATIENCE,
+            "weight_mode": S2_WEIGHT_MODE,
+            "label_smoothing": S2_LABEL_SMOOTH,
+            "threshold": s2_normal_threshold,
+            "threshold_targets": {"fpr": S2_TARGET_FPR, "dr": S2_TARGET_DR},
+            "overall": {
+                "KDDTrain+": s2_train_overall,
+                "KDDTest+": s2_test_overall,
+                "KDDTest-21": s2_test21_overall,
+            },
+        },
+    }
+    report_path = CKPT_DIR / f"report_{RUN_TAG}.json"
+    save_run_report(report_path, report)
