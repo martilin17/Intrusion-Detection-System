@@ -35,8 +35,11 @@ PATIENCE  = 100     # ✅ Fix-4: 50→100，給 Stage-2 更多時間跳出 false
 S2_WEIGHT_MODE = "none"  # "none" | "sqrt" | "linear"
 S2_WEIGHT_CAP = 3.0      # only used when S2_WEIGHT_MODE != "none"
 S2_LABEL_SMOOTH = 0.0
-S2_TARGET_FPR = 0.03     # threshold tuning target on Stage-2 val
-S2_TARGET_DR = 0.90
+S2_TARGET_FPR = 0.045    # softer FPR target to avoid over-conservative threshold
+S2_TARGET_DR = 0.865
+S2_TUNE_TOPK = 8
+S2_TUNE_RELAX_FPR = 0.012
+S2_TUNE_RELAX_DR = 0.012
 
 # ── 共用 ─────────────────────────────────────────────────────────────────────
 DROPOUT   = 0.5
@@ -672,8 +675,11 @@ def predict_labels(mdl: nn.Module, loader: DataLoader, normal_threshold: float =
 @torch.no_grad()
 def tune_normal_threshold(mdl: nn.Module,
                           loader: DataLoader,
-                          target_fpr: float = 0.03,
-                          target_dr: float = 0.90):
+                          target_fpr: float = 0.045,
+                          target_dr: float = 0.865,
+                          topk: int = 8,
+                          relax_fpr: float = 0.012,
+                          relax_dr: float = 0.012):
     mdl.eval()
     all_true, all_argmax, all_attack_prob = [], [], []
 
@@ -688,18 +694,37 @@ def tune_normal_threshold(mdl: nn.Module,
     attack_prob = np.concatenate(all_attack_prob).astype(np.float32)
 
     best_t, best_m, best_score = 0.5, None, float("inf")
+    candidates = []
     for t in np.linspace(0.50, 0.995, 100):
         y_pred = y_argmax.copy()
         y_pred[attack_prob < t] = NORMAL_ID
         m = metrics_overall(y_true, y_pred, normal_id=NORMAL_ID)
-        score = (2.0 * abs(m["FPR"] - target_fpr)) + abs(m["DR"] - target_dr)
+        dr_under = max(0.0, target_dr - m["DR"])
+        score = (1.5 * abs(m["FPR"] - target_fpr)) + abs(m["DR"] - target_dr) + (0.5 * dr_under)
+        candidates.append((float(t), m, float(score)))
         if score < best_score:
             best_t, best_m, best_score = float(t), m, score
 
+    feasible = [
+        (t, m, s) for (t, m, s) in candidates
+        if (m["FPR"] <= target_fpr + relax_fpr) and (m["DR"] >= target_dr - relax_dr)
+    ]
+    if feasible:
+        # Within feasible region, prioritize the same objective score first,
+        # then use ACC as a tie-breaker to avoid over-aggressive thresholds.
+        feasible.sort(key=lambda x: (x[2], -x[1]["ACC"], abs(x[1]["FPR"] - target_fpr), abs(x[1]["DR"] - target_dr)))
+        best_t, best_m, best_score = feasible[0]
+
+    top_by_score = sorted(candidates, key=lambda x: x[2])[:max(1, topk)]
+
     print("\n[Stage-2 Threshold Tuning on Val]")
     print(f"  chosen_threshold={best_t:.4f}")
+    print(f"  chosen_score={best_score:.5f}")
     print(f"  val_DR={best_m['DR']*100:.2f}% | val_FPR={best_m['FPR']*100:.2f}% | val_ACC={best_m['ACC']*100:.2f}%")
     print(f"  target_DR={target_dr*100:.2f}% | target_FPR={target_fpr*100:.2f}%")
+    print("  top-threshold candidates (by score):")
+    for t, m, s in top_by_score:
+        print(f"    t={t:.4f} | score={s:.5f} | DR={m['DR']*100:.2f}% | FPR={m['FPR']*100:.2f}% | ACC={m['ACC']*100:.2f}%")
     return best_t
 
 # =========================
@@ -864,7 +889,12 @@ print("  STAGE-2 RESULTS  ▌ CNN-TL (with Transfer Learning) vs Paper CNN-TL")
 print("=" * 100)
 
 s2_normal_threshold = tune_normal_threshold(
-    cnntl, s2_val_loader, target_fpr=S2_TARGET_FPR, target_dr=S2_TARGET_DR
+    cnntl, s2_val_loader,
+    target_fpr=S2_TARGET_FPR,
+    target_dr=S2_TARGET_DR,
+    topk=S2_TUNE_TOPK,
+    relax_fpr=S2_TUNE_RELAX_FPR,
+    relax_dr=S2_TUNE_RELAX_DR
 )
 print(f"[Stage-2] Apply normal-threshold during eval: {s2_normal_threshold:.4f}")
 
