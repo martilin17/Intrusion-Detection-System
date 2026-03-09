@@ -3,6 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import log_loss
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 
@@ -21,6 +23,14 @@ print("torch:", torch.__version__)
 print("cuda:", torch.cuda.is_available(), "| device:", device)
 if torch.cuda.is_available():
     print("gpu:", torch.cuda.get_device_name(0))
+
+try:
+    from xgboost import XGBClassifier
+
+    HAS_XGBOOST = True
+except Exception:
+    XGBClassifier = None
+    HAS_XGBOOST = False
 
 
 # =========================
@@ -42,37 +52,43 @@ SEQ_LEN = 32
 STRIDE = 1
 
 # Hierarchical setup
-RUN_TAG = "part2_hier_cnn_tl_v4"
+RUN_TAG = "xgboost_cnn_tl_ver2"
 SAVE_RUN_REPORT = True
 BASELINE_REPORT = Path("checkpoints") / "report_part1_v4_2.json"
 
 # Binary gate threshold tuning
 GATE_TARGET_FPR = 0.045
-GATE_TARGET_DR = 0.89
+GATE_TARGET_DR = 0.875
 GATE_TUNE_TOPK = 8
 GATE_TUNE_RELAX_FPR = 0.012
 GATE_TUNE_RELAX_DR = 0.020
 GATE_THR_MIN = 0.50
 GATE_THR_MAX = 0.95
 GATE_THR_STEPS = 160
-GATE_SCORE_W_FPR = 1.2
-GATE_SCORE_W_DR = 1.8
-GATE_SCORE_W_DR_UNDER = 2.2
+GATE_SCORE_W_FPR = 1.8
+GATE_SCORE_W_DR = 1.4
+GATE_SCORE_W_DR_UNDER = 1.8
 
-# Attack confidence threshold tuning
-ATK_CONF_MIN = 0.20
-ATK_CONF_MAX = 0.80
-ATK_CONF_STEPS = 61
+# Joint threshold tuning: joint_score = gate_attack_prob * atk_conf
+JOINT_THR_MIN = 0.20
+JOINT_THR_MAX = 0.50
+JOINT_THR_STEPS = 61
 
 # Class-weight modes
 BIN_S1_W_MODE, BIN_S1_W_CAP = "sqrt", None
 BIN_S2_W_MODE, BIN_S2_W_CAP = "none", None
 ATK_S1_W_MODE, ATK_S1_W_CAP = "sqrt", 8.0
-ATK_S2_W_MODE, ATK_S2_W_CAP = "sqrt", 8.0
+ATK_S2_W_MODE, ATK_S2_W_CAP = "sqrt", 15.0
 BIN_S2_NORMAL_WEIGHT_BOOST = 1.0
 BIN_S2_FREEZE_BLOCK3 = False
 BIN_S2_LR_NEW = 1e-3
 BIN_S2_BLOCK3_LR_FACTOR = 0.10
+
+# Binary gate tree model (replaces CNN-TL gate)
+GATE_TREE_BACKEND = "auto"  # "auto" | "xgb" | "hgb"
+GATE_TREE_NORMAL_WEIGHT = 1.10
+GATE_TREE_NORMAL_WEIGHT_CANDIDATES = [0.95, 1.00, 1.10, 1.25]
+GATE_TREE_MAX_ITER = 400
 
 
 # =========================
@@ -321,6 +337,11 @@ X_tr_b_atk, y_tr_b_atk_4 = filter_attack(X_tr_b_seq, y_tr_b_seq_5)
 X_val_b_atk, y_val_b_atk_4 = filter_attack(X_val_b_seq, y_val_b_seq_5)
 X_tr_t_atk, y_tr_t_atk_4 = filter_attack(X_tr_t, y_tr_t_5)
 X_val_t_atk, y_val_t_atk_4 = filter_attack(X_val_t, y_val_t_5)
+
+
+def flatten_seq_for_gate(X_seq: np.ndarray) -> np.ndarray:
+    # Keep the same (F, L) order as SeqDataset output tensors for consistent inference.
+    return X_seq.transpose(0, 2, 1).reshape(X_seq.shape[0], -1).astype(np.float32)
 
 
 # =========================
@@ -670,26 +691,90 @@ def train_stage2(
     return model, best_loss
 
 
-# =========================
-# 6) Train binary gate + attack-4 classifier
-# =========================
-bin_cnnb = train_stage1("BIN", 2, bin_s1_train, bin_s1_val, cw_bin_s1, "hier_bin")
-bin_cnntl, bin_best = train_stage2(
-    "BIN",
-    bin_cnnb,
-    2,
-    bin_s2_train,
-    bin_s2_val,
-    cw_bin_s2,
-    "hier_bin",
-    lr_new=BIN_S2_LR_NEW,
-    block3_lr_factor=BIN_S2_BLOCK3_LR_FACTOR,
-    freeze_block3=BIN_S2_FREEZE_BLOCK3,
-)
-print(f"\n[BIN] Stage-2 best val loss: {bin_best:.6f}")
+def train_binary_gate_tree_once(
+    X_tr_seq: np.ndarray,
+    y_tr_bin: np.ndarray,
+    X_val_seq: np.ndarray,
+    y_val_bin: np.ndarray,
+    normal_weight: float,
+):
+    Xtr = flatten_seq_for_gate(X_tr_seq)
+    Xva = flatten_seq_for_gate(X_val_seq)
+    sample_weight = np.where(y_tr_bin == 0, normal_weight, 1.0).astype(np.float32)
 
-atk_cnnb = train_stage1("ATK4", 4, atk_s1_train, atk_s1_val, cw_atk_s1, "hier_atk4")
+    backend = "hgb"
+    model = None
+    if GATE_TREE_BACKEND in ("auto", "xgb") and HAS_XGBOOST:
+        backend = "xgb"
+        model = XGBClassifier(
+            n_estimators=GATE_TREE_MAX_ITER,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            n_jobs=0,
+            random_state=SEED,
+        )
+        model.fit(Xtr, y_tr_bin, sample_weight=sample_weight, eval_set=[(Xva, y_val_bin)], verbose=False)
+    else:
+        model = HistGradientBoostingClassifier(
+            learning_rate=0.05,
+            max_iter=GATE_TREE_MAX_ITER,
+            max_depth=6,
+            random_state=SEED,
+        )
+        model.fit(Xtr, y_tr_bin, sample_weight=sample_weight)
+
+    tr_prob = model.predict_proba(Xtr)[:, 1]
+    va_prob = model.predict_proba(Xva)[:, 1]
+    tr_loss = float(log_loss(y_tr_bin, tr_prob, labels=[0, 1]))
+    va_loss = float(log_loss(y_val_bin, va_prob, labels=[0, 1]))
+
+    info = {
+        "backend": backend,
+        "normal_weight": float(normal_weight),
+        "max_iter": int(GATE_TREE_MAX_ITER),
+        "train_logloss": tr_loss,
+        "val_logloss": va_loss,
+    }
+    print(
+        f"\n[BIN Gate Tree] backend={backend} | normal_weight={normal_weight:.2f} "
+        f"| train_logloss={tr_loss:.6f} | val_logloss={va_loss:.6f}"
+    )
+    return model, info
+
+
+def gate_predict_attack_prob(gate_model, xb: torch.Tensor) -> np.ndarray:
+    x_flat = xb.detach().cpu().numpy().astype(np.float32).reshape(xb.size(0), -1)
+    return gate_model.predict_proba(x_flat)[:, 1].astype(np.float32)
+
+
+def train_binary_gate_tree_candidates(
+    X_tr_seq: np.ndarray,
+    y_tr_bin: np.ndarray,
+    X_val_seq: np.ndarray,
+    y_val_bin: np.ndarray,
+):
+    candidates = []
+    for normal_w in GATE_TREE_NORMAL_WEIGHT_CANDIDATES:
+        mdl, info = train_binary_gate_tree_once(X_tr_seq, y_tr_bin, X_val_seq, y_val_bin, normal_w)
+        candidates.append({"model": mdl, "info": info})
+    return candidates
+
+
+# =========================
+# 6) Train binary gate (Tree) + attack-4 classifier (CNN-TL)
+# =========================
+bin_gate_candidates = train_binary_gate_tree_candidates(X_tr_t, y_tr_t_bin, X_val_t, y_val_t_bin)
+
+
+# 把 atk_s1_train / atk_s1_val 改成用 X_tr_t_atk / X_val_t_atk
+atk_cnnb = train_stage1("ATK4", 4, atk_s2_train, atk_s2_val, cw_atk_s2, "hier_atk4")
 atk_cnntl, atk_best = train_stage2("ATK4", atk_cnnb, 4, atk_s2_train, atk_s2_val, cw_atk_s2, "hier_atk4")
+
+
 print(f"\n[ATK4] Stage-2 best val loss: {atk_best:.6f}")
 
 
@@ -740,18 +825,17 @@ def metrics_per_class(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
 
 
 @torch.no_grad()
-def collect_hier_scores(gate_model: nn.Module, atk_model: nn.Module, loader: DataLoader):
-    gate_model.eval()
+def collect_hier_scores(gate_model, atk_model: nn.Module, loader: DataLoader):
     atk_model.eval()
     all_true5, all_gate_attack_prob, all_atk_pred4, all_atk_conf = [], [], [], []
     for xb, yb in loader:
+        gate_attack_prob = gate_predict_attack_prob(gate_model, xb)
         xb = xb.to(device)
-        gate_probs = torch.softmax(gate_model(xb), dim=1)
         atk_probs = torch.softmax(atk_model(xb), dim=1)
         atk_conf, atk_pred4 = torch.max(atk_probs, dim=1)
 
         all_true5.append(yb.numpy().astype(np.int64))
-        all_gate_attack_prob.append(gate_probs[:, 1].cpu().numpy().astype(np.float32))
+        all_gate_attack_prob.append(gate_attack_prob)
         all_atk_pred4.append(atk_pred4.cpu().numpy().astype(np.int64))
         all_atk_conf.append(atk_conf.cpu().numpy().astype(np.float32))
 
@@ -768,17 +852,18 @@ def hierarchical_pred_from_scores(
     atk_pred4: np.ndarray,
     atk_conf: np.ndarray,
     gate_thr: float,
-    atk_conf_thr: float,
+    joint_thr: float,
 ):
     y_pred5 = np.full_like(atk_pred4, NORMAL_ID, dtype=np.int64)
-    promote = (gate_attack_prob >= gate_thr) & (atk_conf >= atk_conf_thr)
+    joint_score = gate_attack_prob * atk_conf
+    promote = (gate_attack_prob >= gate_thr) & (joint_score >= joint_thr)
     if promote.any():
         y_pred5[promote] = ATTACK4_TO_FIVE[atk_pred4[promote]]
     return y_pred5
 
 
 def tune_hier_thresholds(
-    gate_model: nn.Module,
+    gate_model,
     atk_model: nn.Module,
     loader: DataLoader,
     target_fpr: float = 0.045,
@@ -786,17 +871,18 @@ def tune_hier_thresholds(
     topk: int = 8,
     relax_fpr: float = 0.012,
     relax_dr: float = 0.012,
+    verbose: bool = True,
 ):
     y_true5, gate_attack_prob, atk_pred4, atk_conf = collect_hier_scores(gate_model, atk_model, loader)
 
     gate_grid = np.linspace(GATE_THR_MIN, GATE_THR_MAX, GATE_THR_STEPS)
-    atk_grid = np.linspace(ATK_CONF_MIN, ATK_CONF_MAX, ATK_CONF_STEPS)
+    joint_grid = np.linspace(JOINT_THR_MIN, JOINT_THR_MAX, JOINT_THR_STEPS)
     candidates = []
 
-    best_g, best_a, best_m, best_score = 0.5, 0.5, None, float("inf")
+    best_g, best_j, best_m, best_score = 0.5, 0.5, None, float("inf")
     for g in gate_grid:
-        for a in atk_grid:
-            y_pred5 = hierarchical_pred_from_scores(gate_attack_prob, atk_pred4, atk_conf, float(g), float(a))
+        for j in joint_grid:
+            y_pred5 = hierarchical_pred_from_scores(gate_attack_prob, atk_pred4, atk_conf, float(g), float(j))
             m = metrics_overall(y_true5, y_pred5, normal_id=NORMAL_ID)
             dr_under = max(0.0, target_dr - m["DR"])
             score = (
@@ -804,9 +890,9 @@ def tune_hier_thresholds(
                 + (GATE_SCORE_W_DR * abs(m["DR"] - target_dr))
                 + (GATE_SCORE_W_DR_UNDER * dr_under)
             )
-            candidates.append((float(g), float(a), m, float(score)))
+            candidates.append((float(g), float(j), m, float(score)))
             if score < best_score:
-                best_g, best_a, best_m, best_score = float(g), float(a), m, float(score)
+                best_g, best_j, best_m, best_score = float(g), float(j), m, float(score)
 
     feasible = [
         (g, a, m, s)
@@ -817,56 +903,62 @@ def tune_hier_thresholds(
         feasible.sort(
             key=lambda x: (x[3], -x[2]["ACC"], abs(x[2]["FPR"] - target_fpr), abs(x[2]["DR"] - target_dr))
         )
-        best_g, best_a, best_m, best_score = feasible[0]
+        best_g, best_j, best_m, best_score = feasible[0]
     else:
-        # If no feasible point exists, minimize DR shortfall first, then FPR overflow.
-        candidates.sort(
+        # If no feasible point exists, keep DR within a floor first, then minimize FPR overflow.
+        dr_floor = target_dr - max(relax_dr, 0.03)
+        near_dr = [c for c in candidates if c[2]["DR"] >= dr_floor]
+        pool = near_dr if near_dr else candidates
+        pool.sort(
             key=lambda x: (
-                max(0.0, target_dr - x[2]["DR"]),
                 max(0.0, x[2]["FPR"] - target_fpr),
+                max(0.0, target_dr - x[2]["DR"]),
                 x[3],
                 -x[2]["ACC"],
             )
         )
-        best_g, best_a, best_m, best_score = candidates[0]
+        best_g, best_j, best_m, best_score = pool[0]
 
-    top = sorted(candidates, key=lambda x: x[3])[: max(1, topk)]
-    print("\n[Hier Threshold Tuning on Val (gate + atk_conf)]")
-    print(
-        f"  chosen_gate_threshold={best_g:.4f} | chosen_atk_conf_threshold={best_a:.4f} | "
-        f"chosen_score={best_score:.5f}"
-    )
-    print(f"  val_DR={best_m['DR']*100:.2f}% | val_FPR={best_m['FPR']*100:.2f}% | val_ACC={best_m['ACC']*100:.2f}%")
-    print(f"  target_DR={target_dr*100:.2f}% | target_FPR={target_fpr*100:.2f}%")
-    print("  top-threshold candidates:")
-    for g, a, m, s in top:
+    if verbose:
+        top = sorted(candidates, key=lambda x: x[3])[: max(1, topk)]
+        print("\n[Hier Threshold Tuning on Val (gate + joint)]")
         print(
-            f"    g={g:.4f} | a={a:.4f} | score={s:.5f} | "
-            f"DR={m['DR']*100:.2f}% | FPR={m['FPR']*100:.2f}% | ACC={m['ACC']*100:.2f}%"
+            f"  chosen_gate_threshold={best_g:.4f} | chosen_joint_threshold={best_j:.4f} | "
+            f"chosen_score={best_score:.5f}"
         )
-    return best_g, best_a, best_m
+        print(f"  val_DR={best_m['DR']*100:.2f}% | val_FPR={best_m['FPR']*100:.2f}% | val_ACC={best_m['ACC']*100:.2f}%")
+        print(f"  target_DR={target_dr*100:.2f}% | target_FPR={target_fpr*100:.2f}%")
+        print("  top-threshold candidates:")
+        for g, j, m, s in top:
+            print(
+                f"    g={g:.4f} | j={j:.4f} | score={s:.5f} | "
+                f"DR={m['DR']*100:.2f}% | FPR={m['FPR']*100:.2f}% | ACC={m['ACC']*100:.2f}%"
+            )
+    return best_g, best_j, best_m, float(best_score)
 
 
 @torch.no_grad()
 def predict_hierarchical_5(
-    gate_model: nn.Module, atk_model: nn.Module, loader: DataLoader, gate_thr: float, atk_conf_thr: float
+    gate_model, atk_model: nn.Module, loader: DataLoader, gate_thr: float, joint_thr: float
 ):
-    gate_model.eval()
     atk_model.eval()
     trues, preds = [], []
     map_tensor = torch.tensor(ATTACK4_TO_FIVE, dtype=torch.long, device=device)
 
     for xb, yb in loader:
+        gate_attack_prob = gate_predict_attack_prob(gate_model, xb)
         xb = xb.to(device)
-        gate_probs = torch.softmax(gate_model(xb), dim=1)
-        gate_attack = gate_probs[:, 1] >= gate_thr
+        gate_attack_prob_t = torch.from_numpy(gate_attack_prob).to(device)
+        gate_attack = gate_attack_prob_t >= gate_thr
 
         yhat5 = torch.full((xb.size(0),), NORMAL_ID, dtype=torch.long, device=device)
         if gate_attack.any():
             atk_probs = torch.softmax(atk_model(xb[gate_attack]), dim=1)
             atk_conf, atk_pred4 = torch.max(atk_probs, dim=1)
+            gate_attack_prob_sel = gate_attack_prob_t[gate_attack]
+            joint_score = gate_attack_prob_sel * atk_conf
             promote_idx = torch.nonzero(gate_attack, as_tuple=False).squeeze(1)
-            promote_mask = atk_conf >= atk_conf_thr
+            promote_mask = joint_score >= joint_thr
             if promote_mask.any():
                 yhat5[promote_idx[promote_mask]] = map_tensor[atk_pred4[promote_mask]]
 
@@ -899,12 +991,12 @@ def print_table(ds_name: str, per_class: list, overall: dict):
 def eval_hier_dataset(
     ds_name: str,
     loader: DataLoader,
-    gate_model: nn.Module,
+    gate_model,
     atk_model: nn.Module,
     gate_thr: float,
-    atk_conf_thr: float,
+    joint_thr: float,
 ):
-    y_true, y_pred = predict_hierarchical_5(gate_model, atk_model, loader, gate_thr, atk_conf_thr)
+    y_true, y_pred = predict_hierarchical_5(gate_model, atk_model, loader, gate_thr, joint_thr)
     overall = metrics_overall(y_true, y_pred, normal_id=NORMAL_ID)
     per_class = metrics_per_class(y_true, y_pred, len(CLASS_NAMES_5))
     print_table(ds_name, per_class, overall)
@@ -914,8 +1006,57 @@ def eval_hier_dataset(
 # =========================
 # 8) Evaluation + report
 # =========================
-gate_thr, atk_conf_thr, gate_val = tune_hier_thresholds(
-    bin_cnntl,
+gate_selection_rows = []
+for idx, cand in enumerate(bin_gate_candidates):
+    cg, cj, cm, cs = tune_hier_thresholds(
+        cand["model"],
+        atk_cnntl,
+        eval_val_t_5,
+        target_fpr=GATE_TARGET_FPR,
+        target_dr=GATE_TARGET_DR,
+        topk=GATE_TUNE_TOPK,
+        relax_fpr=GATE_TUNE_RELAX_FPR,
+        relax_dr=GATE_TUNE_RELAX_DR,
+        verbose=False,
+    )
+    gate_selection_rows.append(
+        {
+            "idx": idx,
+            "normal_weight": cand["info"]["normal_weight"],
+            "backend": cand["info"]["backend"],
+            "val_DR": float(cm["DR"]),
+            "val_FPR": float(cm["FPR"]),
+            "val_ACC": float(cm["ACC"]),
+            "score": float(cs),
+            "gate_threshold": float(cg),
+            "joint_threshold": float(cj),
+        }
+    )
+
+gate_selection_rows.sort(
+    key=lambda r: (
+        r["score"],
+        abs(r["val_FPR"] - GATE_TARGET_FPR),
+        abs(r["val_DR"] - GATE_TARGET_DR),
+        -r["val_ACC"],
+    )
+)
+best_gate_row = gate_selection_rows[0]
+best_gate_idx = int(best_gate_row["idx"])
+bin_gate_model = bin_gate_candidates[best_gate_idx]["model"]
+bin_gate_info = bin_gate_candidates[best_gate_idx]["info"]
+
+print("\n[Gate Candidate Selection on Val]")
+for row in gate_selection_rows:
+    mark = " <= selected" if int(row["idx"]) == best_gate_idx else ""
+    print(
+        f"  idx={row['idx']} | backend={row['backend']} | normal_w={row['normal_weight']:.2f} | "
+        f"score={row['score']:.5f} | DR={row['val_DR']*100:.2f}% | FPR={row['val_FPR']*100:.2f}% | "
+        f"ACC={row['val_ACC']*100:.2f}% | g={row['gate_threshold']:.4f} | j={row['joint_threshold']:.4f}{mark}"
+    )
+
+gate_thr, joint_thr, gate_val, gate_score = tune_hier_thresholds(
+    bin_gate_model,
     atk_cnntl,
     eval_val_t_5,
     target_fpr=GATE_TARGET_FPR,
@@ -924,11 +1065,11 @@ gate_thr, atk_conf_thr, gate_val = tune_hier_thresholds(
     relax_fpr=GATE_TUNE_RELAX_FPR,
     relax_dr=GATE_TUNE_RELAX_DR,
 )
-print(f"[Hier] Apply thresholds: gate={gate_thr:.4f}, atk_conf={atk_conf_thr:.4f}")
+print(f"[Hier] Apply thresholds: gate={gate_thr:.4f}, joint={joint_thr:.4f}")
 
-train_overall, _ = eval_hier_dataset("KDDTrain+", eval_train_5, bin_cnntl, atk_cnntl, gate_thr, atk_conf_thr)
-test_overall, _ = eval_hier_dataset("KDDTest+", eval_test_5, bin_cnntl, atk_cnntl, gate_thr, atk_conf_thr)
-test21_overall, _ = eval_hier_dataset("KDDTest-21", eval_test21_5, bin_cnntl, atk_cnntl, gate_thr, atk_conf_thr)
+train_overall, _ = eval_hier_dataset("KDDTrain+", eval_train_5, bin_gate_model, atk_cnntl, gate_thr, joint_thr)
+test_overall, _ = eval_hier_dataset("KDDTest+", eval_test_5, bin_gate_model, atk_cnntl, gate_thr, joint_thr)
+test21_overall, _ = eval_hier_dataset("KDDTest-21", eval_test21_5, bin_gate_model, atk_cnntl, gate_thr, joint_thr)
 
 baseline_stage2 = None
 if BASELINE_REPORT.exists():
@@ -954,24 +1095,23 @@ if SAVE_RUN_REPORT:
         "stride": STRIDE,
         "part": "hierarchical_cnn_tl",
         "binary_gate": {
-            "stage2_best_val_loss": float(bin_best),
-            "stage2_setup": {
-                "weight_mode": BIN_S2_W_MODE,
-                "normal_weight_boost": BIN_S2_NORMAL_WEIGHT_BOOST,
-                "freeze_block3": BIN_S2_FREEZE_BLOCK3,
-                "lr_new": BIN_S2_LR_NEW,
-                "block3_lr_factor": BIN_S2_BLOCK3_LR_FACTOR,
+            "model": "tree_gate",
+            "tree_train_info": bin_gate_info,
+            "candidate_selection": {
+                "selected_idx": best_gate_idx,
+                "selected_score": gate_score,
+                "rows": gate_selection_rows,
             },
             "gate_threshold": float(gate_thr),
-            "attack_conf_threshold": float(atk_conf_thr),
+            "joint_threshold": float(joint_thr),
             "threshold_targets": {"fpr": GATE_TARGET_FPR, "dr": GATE_TARGET_DR},
             "threshold_search_space": {
                 "gate_thr_min": GATE_THR_MIN,
                 "gate_thr_max": GATE_THR_MAX,
                 "gate_thr_steps": GATE_THR_STEPS,
-                "atk_conf_min": ATK_CONF_MIN,
-                "atk_conf_max": ATK_CONF_MAX,
-                "atk_conf_steps": ATK_CONF_STEPS,
+                "joint_thr_min": JOINT_THR_MIN,
+                "joint_thr_max": JOINT_THR_MAX,
+                "joint_thr_steps": JOINT_THR_STEPS,
                 "score_weights": {
                     "fpr": GATE_SCORE_W_FPR,
                     "dr": GATE_SCORE_W_DR,
