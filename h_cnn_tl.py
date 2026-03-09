@@ -57,17 +57,17 @@ SAVE_RUN_REPORT = True
 BASELINE_REPORT = Path("checkpoints") / "report_part1_v4_2.json"
 
 # Binary gate threshold tuning
-GATE_TARGET_FPR = 0.045
-GATE_TARGET_DR = 0.875
+GATE_TARGET_FPR = 0.030
+GATE_TARGET_DR = 0.9
 GATE_TUNE_TOPK = 8
 GATE_TUNE_RELAX_FPR = 0.012
 GATE_TUNE_RELAX_DR = 0.020
 GATE_THR_MIN = 0.50
-GATE_THR_MAX = 0.95
+GATE_THR_MAX = 0.65
 GATE_THR_STEPS = 160
 GATE_SCORE_W_FPR = 1.8
 GATE_SCORE_W_DR = 1.4
-GATE_SCORE_W_DR_UNDER = 1.8
+GATE_SCORE_W_DR_UNDER = 6.0
 
 # Joint threshold tuning: joint_score = gate_attack_prob * atk_conf
 JOINT_THR_MIN = 0.20
