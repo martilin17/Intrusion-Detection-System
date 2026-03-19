@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import log_loss
+from sklearn.metrics import f1_score, log_loss
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 
@@ -120,6 +120,12 @@ ATTACK4_TO_FIVE = np.array(
     ],
     dtype=np.int64,
 )
+
+PAPER_TL_OVERALL = {
+    "KDDTrain+": {"DR": 83.05, "ACC": 94.98, "FPR": 3.22},
+    "KDDTest+": {"DR": 93.15, "ACC": 94.18, "FPR": 1.72},
+    "KDDTest-21": {"DR": 88.46, "ACC": 90.01, "FPR": 2.83},
+}
 
 
 # =========================
@@ -314,10 +320,24 @@ X_test21_seq, y_test21_seq_5 = make_sequences(X_test21_s, y_test21_5, SEQ_LEN, S
 
 print("\nStage-1 seq shapes | tr_b:", X_tr_b_seq.shape, "| val_b:", X_val_b_seq.shape)
 
-X_tr_t, X_val_t, y_tr_t_5, y_val_t_5 = train_test_split(
-    X_test_seq, y_test_seq_5, test_size=0.20, random_state=SEED, stratify=y_test_seq_5
+# Stage-2 split with leakage control:
+# - train: used to fit gate/attack models
+# - tune:  used to choose thresholds / candidate selection
+# - eval:  final holdout evaluation on KDDTest+ (never seen in train/tune)
+X_tr_t, X_tmp_t, y_tr_t_5, y_tmp_t_5 = train_test_split(
+    X_test_seq, y_test_seq_5, test_size=0.30, random_state=SEED, stratify=y_test_seq_5
 )
-print("Stage-2 seq shapes | tr_t:", X_tr_t.shape, "| val_t:", X_val_t.shape)
+X_tune_t, X_eval_t, y_tune_t_5, y_eval_t_5 = train_test_split(
+    X_tmp_t, y_tmp_t_5, test_size=(2.0 / 3.0), random_state=SEED, stratify=y_tmp_t_5
+)
+print(
+    "Stage-2 seq shapes | tr_t:",
+    X_tr_t.shape,
+    "| tune_t:",
+    X_tune_t.shape,
+    "| eval_t:",
+    X_eval_t.shape,
+)
 
 
 def to_binary(y5: np.ndarray) -> np.ndarray:
@@ -337,12 +357,14 @@ y_train_seq_bin = to_binary(y_train_seq_5)
 y_test_seq_bin = to_binary(y_test_seq_5)
 y_test21_seq_bin = to_binary(y_test21_seq_5)
 y_tr_t_bin = to_binary(y_tr_t_5)
-y_val_t_bin = to_binary(y_val_t_5)
+y_tune_t_bin = to_binary(y_tune_t_5)
+y_eval_t_bin = to_binary(y_eval_t_5)
 
 X_tr_b_atk, y_tr_b_atk_4 = filter_attack(X_tr_b_seq, y_tr_b_seq_5)
 X_val_b_atk, y_val_b_atk_4 = filter_attack(X_val_b_seq, y_val_b_seq_5)
 X_tr_t_atk, y_tr_t_atk_4 = filter_attack(X_tr_t, y_tr_t_5)
-X_val_t_atk, y_val_t_atk_4 = filter_attack(X_val_t, y_val_t_5)
+X_tune_t_atk, y_tune_t_atk_4 = filter_attack(X_tune_t, y_tune_t_5)
+X_eval_t_atk, y_eval_t_atk_4 = filter_attack(X_eval_t, y_eval_t_5)
 
 
 def flatten_seq_for_gate(X_seq: np.ndarray) -> np.ndarray:
@@ -373,19 +395,19 @@ def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool):
 bin_s1_train = make_loader(X_tr_b_seq, y_tr_b_seq_bin, BATCH_B, True)
 bin_s1_val = make_loader(X_val_b_seq, y_val_b_seq_bin, BATCH_B, False)
 bin_s2_train = make_loader(X_tr_t, y_tr_t_bin, BATCH_T, True)
-bin_s2_val = make_loader(X_val_t, y_val_t_bin, BATCH_T, False)
+bin_s2_val = make_loader(X_tune_t, y_tune_t_bin, BATCH_T, False)
 
 # Attack-4 loaders
 atk_s1_train = make_loader(X_tr_b_atk, y_tr_b_atk_4, BATCH_B, True)
 atk_s1_val = make_loader(X_val_b_atk, y_val_b_atk_4, BATCH_B, False)
 atk_s2_train = make_loader(X_tr_t_atk, y_tr_t_atk_4, BATCH_T, True)
-atk_s2_val = make_loader(X_val_t_atk, y_val_t_atk_4, BATCH_T, False)
+atk_s2_val = make_loader(X_tune_t_atk, y_tune_t_atk_4, BATCH_T, False)
 
 # Evaluation loaders on full 5-class labels
 eval_train_5 = make_loader(X_train_seq, y_train_seq_5, BATCH_B, False)
-eval_test_5 = make_loader(X_test_seq, y_test_seq_5, BATCH_B, False)
+eval_test_5 = make_loader(X_eval_t, y_eval_t_5, BATCH_B, False)
 eval_test21_5 = make_loader(X_test21_seq, y_test21_seq_5, BATCH_B, False)
-eval_val_t_5 = make_loader(X_val_t, y_val_t_5, BATCH_T, False)
+eval_tune_t_5 = make_loader(X_tune_t, y_tune_t_5, BATCH_T, False)
 
 
 # =========================
@@ -889,7 +911,7 @@ def train_binary_gate_tree_candidates(
 # =========================
 # 6) Train binary gate (Tree) + attack-4 classifier (CNN-LSTM)
 # =========================
-bin_gate_candidates = train_binary_gate_tree_candidates(X_tr_t, y_tr_t_bin, X_val_t, y_val_t_bin)
+bin_gate_candidates = train_binary_gate_tree_candidates(X_tr_t, y_tr_t_bin, X_tune_t, y_tune_t_bin)
 
 
 atk_model, atk_best = train_attack_cnn_lstm(atk_s2_train, atk_s2_val, cw_atk_s2)
@@ -940,6 +962,16 @@ def metrics_per_class(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int):
             }
         )
     return out
+
+
+def metrics_multiclass_5(y_true: np.ndarray, y_pred: np.ndarray):
+    y_true = y_true.astype(np.int64)
+    y_pred = y_pred.astype(np.int64)
+    labels = list(range(len(CLASS_NAMES_5)))
+    acc5 = float((y_true == y_pred).mean())
+    macro_f1 = float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0))
+    weighted_f1 = float(f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0))
+    return {"ACC_5CLS": acc5, "MACRO_F1": macro_f1, "WEIGHTED_F1": weighted_f1}
 
 
 @torch.no_grad()
@@ -1086,7 +1118,7 @@ def predict_hierarchical_5(
     return np.concatenate(trues), np.concatenate(preds)
 
 
-def print_table(ds_name: str, per_class: list, overall: dict):
+def print_table(ds_name: str, per_class: list, overall: dict, mc5: dict):
     print("\n" + "=" * 82)
     print(f"  Dataset: {ds_name}   Model: {ATTACK_MODEL_TAG}")
     print("=" * 82)
@@ -1104,6 +1136,10 @@ def print_table(ds_name: str, per_class: list, overall: dict):
         f"{overall['tp']:7d} {overall['fn']:7d} {overall['fp']:7d} {overall['tn']:7d}"
     )
     print("=" * 82)
+    print(
+        f"[5-class] ACC={mc5['ACC_5CLS']*100:.2f}% | "
+        f"Macro-F1={mc5['MACRO_F1']*100:.2f}% | Weighted-F1={mc5['WEIGHTED_F1']*100:.2f}%"
+    )
 
 
 def eval_hier_dataset(
@@ -1117,8 +1153,9 @@ def eval_hier_dataset(
     y_true, y_pred = predict_hierarchical_5(gate_model, atk_model, loader, gate_thr, joint_thr)
     overall = metrics_overall(y_true, y_pred, normal_id=NORMAL_ID)
     per_class = metrics_per_class(y_true, y_pred, len(CLASS_NAMES_5))
-    print_table(ds_name, per_class, overall)
-    return overall, per_class
+    mc5 = metrics_multiclass_5(y_true, y_pred)
+    print_table(ds_name, per_class, overall, mc5)
+    return overall, per_class, mc5
 
 
 # =========================
@@ -1129,7 +1166,7 @@ for idx, cand in enumerate(bin_gate_candidates):
     cg, cj, cm, cs = tune_hier_thresholds(
         cand["model"],
         atk_model,
-        eval_val_t_5,
+        eval_tune_t_5,
         target_fpr=GATE_TARGET_FPR,
         target_dr=GATE_TARGET_DR,
         topk=GATE_TUNE_TOPK,
@@ -1176,7 +1213,7 @@ for row in gate_selection_rows:
 gate_thr, joint_thr, gate_val, gate_score = tune_hier_thresholds(
     bin_gate_model,
     atk_model,
-    eval_val_t_5,
+    eval_tune_t_5,
     target_fpr=GATE_TARGET_FPR,
     target_dr=GATE_TARGET_DR,
     topk=GATE_TUNE_TOPK,
@@ -1185,9 +1222,22 @@ gate_thr, joint_thr, gate_val, gate_score = tune_hier_thresholds(
 )
 print(f"[Hier] Apply thresholds: gate={gate_thr:.4f}, joint={joint_thr:.4f}")
 
-train_overall, _ = eval_hier_dataset("KDDTrain+", eval_train_5, bin_gate_model, atk_model, gate_thr, joint_thr)
-test_overall, _ = eval_hier_dataset("KDDTest+", eval_test_5, bin_gate_model, atk_model, gate_thr, joint_thr)
-test21_overall, _ = eval_hier_dataset("KDDTest-21", eval_test21_5, bin_gate_model, atk_model, gate_thr, joint_thr)
+train_overall, _, train_mc5 = eval_hier_dataset("KDDTrain+", eval_train_5, bin_gate_model, atk_model, gate_thr, joint_thr)
+test_holdout_overall, _, test_holdout_mc5 = eval_hier_dataset(
+    "KDDTest+ (Holdout)", eval_test_5, bin_gate_model, atk_model, gate_thr, joint_thr
+)
+test21_overall, _, test21_mc5 = eval_hier_dataset("KDDTest-21", eval_test21_5, bin_gate_model, atk_model, gate_thr, joint_thr)
+
+overall_now = {
+    "KDDTrain+": train_overall,
+    "KDDTest+_holdout": test_holdout_overall,
+    "KDDTest-21": test21_overall,
+}
+overall_mc5 = {
+    "KDDTrain+": train_mc5,
+    "KDDTest+_holdout": test_holdout_mc5,
+    "KDDTest-21": test21_mc5,
+}
 
 baseline_stage2 = None
 if BASELINE_REPORT.exists():
@@ -1197,13 +1247,46 @@ if BASELINE_REPORT.exists():
 
 if baseline_stage2:
     print("\n[Delta vs Part-1 baseline (stage2 overall)]")
-    for ds, ours in [("KDDTrain+", train_overall), ("KDDTest+", test_overall), ("KDDTest-21", test21_overall)]:
+    for ds, ours in [("KDDTrain+", train_overall), ("KDDTest-21", test21_overall)]:
         base = baseline_stage2.get(ds, {})
         if base:
             d_dr = (ours["DR"] - base["DR"]) * 100.0
             d_acc = (ours["ACC"] - base["ACC"]) * 100.0
             d_fpr = (ours["FPR"] - base["FPR"]) * 100.0
-            print(f"  {ds:<10} dDR={d_dr:+6.2f}% | dACC={d_acc:+6.2f}% | dFPR={d_fpr:+6.2f}%")
+            print(f"  {ds:<12} dDR={d_dr:+6.2f}% | dACC={d_acc:+6.2f}% | dFPR={d_fpr:+6.2f}%")
+    if "KDDTest+" in baseline_stage2:
+        base = baseline_stage2["KDDTest+"]
+        ours = test_holdout_overall
+        d_dr = (ours["DR"] - base["DR"]) * 100.0
+        d_acc = (ours["ACC"] - base["ACC"]) * 100.0
+        d_fpr = (ours["FPR"] - base["FPR"]) * 100.0
+        print(
+            f"  {'KDDTest+_holdout':<12} dDR={d_dr:+6.2f}% | dACC={d_acc:+6.2f}% | dFPR={d_fpr:+6.2f}% "
+            f"(note: not directly comparable)"
+        )
+
+print("\n[Delta vs Paper CNN-TL overall]")
+for ds, ours in [("KDDTrain+", train_overall), ("KDDTest-21", test21_overall)]:
+    p = PAPER_TL_OVERALL[ds]
+    d_dr = (ours["DR"] * 100.0) - p["DR"]
+    d_acc = (ours["ACC"] * 100.0) - p["ACC"]
+    d_fpr = (ours["FPR"] * 100.0) - p["FPR"]
+    print(f"  {ds:<12} dDR={d_dr:+6.2f}% | dACC={d_acc:+6.2f}% | dFPR={d_fpr:+6.2f}%")
+paper_test = PAPER_TL_OVERALL["KDDTest+"]
+d_dr = (test_holdout_overall["DR"] * 100.0) - paper_test["DR"]
+d_acc = (test_holdout_overall["ACC"] * 100.0) - paper_test["ACC"]
+d_fpr = (test_holdout_overall["FPR"] * 100.0) - paper_test["FPR"]
+print(
+    f"  {'KDDTest+_holdout':<12} dDR={d_dr:+6.2f}% | dACC={d_acc:+6.2f}% | dFPR={d_fpr:+6.2f}% "
+    f"(note: not directly comparable)"
+)
+
+print("\n[5-class Metrics Summary]")
+for ds, m in overall_mc5.items():
+    print(
+        f"  {ds:<16} ACC={m['ACC_5CLS']*100:6.2f}% | "
+        f"Macro-F1={m['MACRO_F1']*100:6.2f}% | Weighted-F1={m['WEIGHTED_F1']*100:6.2f}%"
+    )
 
 if SAVE_RUN_REPORT:
     report = {
@@ -1212,6 +1295,7 @@ if SAVE_RUN_REPORT:
         "seq_len": SEQ_LEN,
         "stride": STRIDE,
         "part": "hierarchical_xgboost_cnn_lstm",
+        "stage2_split": {"train": 0.70, "tune": 0.10, "eval_holdout": 0.20},
         "binary_gate": {
             "model": "tree_gate",
             "tree_train_info": bin_gate_info,
@@ -1248,9 +1332,11 @@ if SAVE_RUN_REPORT:
         },
         "overall_5class": {
             "KDDTrain+": train_overall,
-            "KDDTest+": test_overall,
+            "KDDTest+_holdout": test_holdout_overall,
             "KDDTest-21": test21_overall,
         },
+        "multiclass_5class_metrics": overall_mc5,
+        "paper_tl_overall_reference": PAPER_TL_OVERALL,
         "baseline_part1_stage2_overall": baseline_stage2,
     }
     out_path = CKPT_DIR / f"report_{RUN_TAG}.json"
